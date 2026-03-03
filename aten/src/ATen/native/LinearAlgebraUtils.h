@@ -117,9 +117,95 @@ inline int64_t batchCount(const Tensor& batched_matrices) {
   return result;
 }
 
-// Computes the number of elements of a matrix in a batched matrix tensor
+/*
+ * Computes the offset between consecutive matrices in a batched tensor.
+ * NOTE: use carefully if the input has memory overlappings in the rows/cols.
+ *
+ * IMPORTANT ASSUMPTIONS:
+ * 1. The input dim >= 2.
+ */
 inline int64_t matrixStride(const Tensor& batched_matrices) {
-  return batched_matrices.size(-1) * batched_matrices.size(-2);
+  // Note: this works for both col-major-/row-major-like matrices,
+  // i.e. (contigous cols/rows some stride apart, with potential holes
+  // between cols/rows).
+  // TODO: do we call this function on row-major input?
+  // If not, then simplify the function's body.
+  const auto m = batched_matrices.size(-2);
+  const auto n = batched_matrices.size(-1);
+  const auto sm = batched_matrices.stride(-2);
+  const auto sn = batched_matrices.stride(-1);
+  return std::max(m * sm, n * sn);
+}
+
+/*
+ * Check whether the input is a (batched) tensor of matrices
+ * with non-overlapping (arbitrary strided) memory layout.
+ *
+ * IMPORTANT ASSUMPTION: A.dim() >= 2
+ */
+inline int64_t is_non_overlapping_matrices(const Tensor& A) {
+  const auto m = A.size(-2);
+  const auto n = A.size(-1);
+  const auto sm = A.stride(-2);
+  const auto sn = A.stride(-1);
+  return (
+      // Checks whether the strides are strictly ordered
+      (sn >= std::max<int64_t>(m * sm, 1) || sm >= std::max<int64_t>(n * sn, 1))
+      // Checks whether the strides are that of a full matrix with m * n elements
+      && (std::max(m * sm, n * sn) >= m * n)
+  );
+}
+
+/*
+ * Check whether the (batched) matrix input has a Math Libs compliant leading dimension, i.e.
+ * 1. stride[non-ld-dim] == 1, and
+ * 2. stride[ld-dim] >= max(sizes[non-ld-dim], 1),
+ * for the input which has a col-major-like layout (check_col_major_like == true)
+ * (contiguous cols with a col stride at least the number of rows)
+ * or a row-major-like_layout (check_col_major_like == false)
+ * (contiguous rows with a row stride at least the number or cols).
+ *
+ * IMPORTANT ASSUMPTIONS:
+ * 1. A.dim() >= 2.
+ * 2. The cols and rows dimensions should not be overlapping!
+ */
+inline bool ld_complies(const Tensor& A, bool check_col_major_like = true) {
+  const int64_t ld_dim = check_col_major_like ? -1 : -2;
+  const int64_t non_ld_dim = check_col_major_like ? -2 : -1;
+  return (
+    A.stride(non_ld_dim) == 1
+    && A.stride(ld_dim) >= std::max<int64_t>(A.size(non_ld_dim), 1)
+  );
+}
+
+/*
+ * Clone a matrix which is compliant with being either
+ * a col-major-like (contiguous cols with a stride between them at least the number of rows), or
+ * a row-major-like (contiguous rows with a stride between them at least the number of cols).
+ * The result is dense and non-overlapping.
+ */
+inline Tensor cloneMatrices(const Tensor& m, bool make_col_major_like = true) {
+  return make_col_major_like
+    ? m.mT().clone(at::MemoryFormat::Contiguous).transpose_(-2, -1)
+    : m.clone(at::MemoryFormat::Contiguous);
+}
+
+/*
+ * Maybe prepare a matrix to be compliant with being either
+ * a col-major-like (contiguous cols with a stride between them at least the number of rows), or
+ * a row-major-like (contiguous rows with a stride between them at least the number of cols).
+ *
+ * NOTE: for now, a clone is always made if there is cols/rows memory overlaps.
+ */
+inline c10::MaybeOwned<Tensor> maybePrepareMatrices(const Tensor& m, bool make_col_major_like = true) {
+  // For now, always make a clone if there is a memory overlap.
+  // Make a clone if the input strides are not compliant with
+  // the requested memory layout.
+  if (!is_non_overlapping_matrices(m) || !ld_complies(m, make_col_major_like)) {
+    return c10::MaybeOwned<Tensor>::owned(cloneMatrices(m, make_col_major_like));
+  }
+
+  return c10::MaybeOwned<Tensor>::borrowed(m);
 }
 
 // Validates input shapes for operations on batches of square matrices (inverse, cholesky, symeig, eig)
