@@ -86,6 +86,7 @@ def _align_to_warpgroup(size: int) -> int:
 
 # Logger for Pallas kernel code
 kernel_code_log = torch._logging.getArtifactLogger(__name__, "kernel_code")
+perf_hint_log = torch._logging.getArtifactLogger(__name__, "perf_hints")
 
 
 class PallasKernelWrapper:
@@ -888,6 +889,14 @@ class PallasKernel(SIMDKernel):
         # Buffers that already use flatten+gather indexing; strided
         # decomposition must not reshape these (it would break flat offsets).
         self.flatten_indexed_buffers: OrderedSet[str] = OrderedSet()
+        # Strided input buffers: map graph buffer name -> per-dim
+        # (stride, offset, skip) triples.  Used to reshape inputs outside
+        # the kernel and generate static indexing inside
+        # (e.g. in_ref[:, :, offset] instead of in_ref[...].flatten()[idx]).
+        self.strided_input_buffers: dict[str, list[tuple[int, int, int]]] = {}
+        # Buffers that already use flatten+gather indexing; strided
+        # decomposition must not reshape these (it would break flat offsets).
+        self.flatten_indexed_buffers: OrderedSet[str] = OrderedSet()
 
     def check_bounds(
         self, expr: sympy.Expr, size: sympy.Expr, lower: bool, upper: bool
@@ -969,7 +978,8 @@ class PallasKernel(SIMDKernel):
         if len(used_vars) == 0:
             # No iteration variables, this is a constant index
             return str(index)
-        elif len(used_vars) == 1:
+
+        if len(used_vars) == 1:
             # Single iteration variable - try to extract stride and offset using BlockPatternMatcher
             var = next(iter(used_vars))
 
@@ -1112,10 +1122,10 @@ class PallasKernel(SIMDKernel):
             return None
         _, buf_size, _, _, _ = info
 
-        buf_shape_or_none = [self._safe_int(s) for s in buf_size]
-        if any(s is None or s <= 0 for s in buf_shape_or_none):
+        buf_shape_maybe = [self._safe_int(s) for s in buf_size]
+        if any(s is None or s <= 0 for s in buf_shape_maybe):
             return None
-        buf_shape: list[int] = cast(list[int], buf_shape_or_none)
+        buf_shape: list[int] = buf_shape_maybe  # type: ignore[assignment]
         ndim = len(buf_shape)
         if ndim == 0:
             return None
@@ -1261,6 +1271,17 @@ class PallasKernel(SIMDKernel):
                 else:
                     new_shape_parts.append(str(dim))
             else:
+                # 1D -> 2D reshape with small inner dim is expensive on TPU
+                # due to tile relayout
+                ndim = len(buf_size)
+                max_stride = max(s for s, _, _ in strides)
+                if ndim == 1 and max_stride < 128:
+                    perf_hint_log.info(
+                        "strided reshape of 1D buffer %s with stride %d "
+                        "may be slow on TPU (tile relayout)",
+                        buf_name,
+                        max_stride,
+                    )
                 code.writeline(
                     f"{param} = {param}.reshape({', '.join(new_shape_parts)})"
                 )
@@ -1938,6 +1959,7 @@ class PallasKernel(SIMDKernel):
         if needs_flatten:
             self.has_flatten_indexing = True
             self.flatten_indexed_buffers.add(name)
+            self.flatten_indexed_buffers.add(name)
             # Flatten then index for non-contiguous access (gather operation)
             has_minmax = index.has(sympy.Min) or index.has(sympy.Max)
             idx = f"({index_str}).astype(jnp.int64)" if has_minmax else index_str
@@ -2092,6 +2114,10 @@ class PallasKernel(SIMDKernel):
 
             # If store compresses but load doesn't, check for strided input vs im2col
             if load_orig_vars != load_prep_vars or store_prep_vars == store_orig_vars:
+                continue
+
+            # Strided inputs are already handled by _decompose_strided_access
+            if buf_name in self.strided_input_buffers:
                 continue
 
             # Check if load coefficients match buffer strides
@@ -2391,12 +2417,32 @@ class PallasKernel(SIMDKernel):
             index_str, needs_flatten = self._adjust_index_for_buffer_shape(
                 name, index, index_str, needs_flatten
             )
+        # Try strided decomposition before multidim slice or flatten.
+        # This generates reshape + static indexing which works on both
+        # CPU and TPU (unlike slice notation which fails on Mosaic).
+        decomp = self._decompose_strided_access(index, name)
+        if decomp is not None:
+            self.strided_input_buffers[name] = decomp
+            load_expr = self._strided_load_expr(buf, decomp)
+        else:
+            # Adjust index for buffer shape (scalar, multi-dim, etc.)
+            index_str, needs_flatten = self._adjust_index_for_buffer_shape(
+                name, index, index_str, needs_flatten
+            )
 
             # Try to emit multi-dim slice instead of flatten + gather
             index_str, needs_flatten = self._try_multidim_slice(
                 name, index, index_str, needs_flatten
             )
+            # Try to emit multi-dim slice instead of flatten + gather
+            index_str, needs_flatten = self._try_multidim_slice(
+                name, index, index_str, needs_flatten
+            )
 
+            # Build the load expression
+            load_expr = self._build_load_expr(
+                buf, name, index, index_str, needs_flatten
+            )
             # Build the load expression
             load_expr = self._build_load_expr(
                 buf, name, index, index_str, needs_flatten
@@ -2990,12 +3036,15 @@ class PallasKernel(SIMDKernel):
                 # Same ndim: check dimensions match or are broadcast (1).
                 # Allow transposed last-2 dims and strided buffers.
                 is_strided = buf_name in self.strided_input_buffers
+                # Allow transposed last-2 dims and strided buffers.
+                is_strided = buf_name in self.strided_input_buffers
                 mismatch = False
                 for i in range(ref_nd):
                     if (
                         int_size[i] == ref_shape[i]
                         or int_size[i] == 1
                         or ref_shape[i] == 1
+                        or is_strided
                         or is_strided
                     ):
                         continue
@@ -3024,6 +3073,7 @@ class PallasKernel(SIMDKernel):
                     return False
 
                 # At least one buffer with a tileable dim
+                if is_strided or any(
                 if is_strided or any(
                     int_size[i] == ref_shape[i] and ref_shape[i] > 1
                     for i in range(ref_nd)
@@ -3204,6 +3254,30 @@ class PallasKernel(SIMDKernel):
         # generated (used_iter_vars is populated during load/store codegen).
         self.tile_cpu_tpu = self._can_tile_cpu_tpu()
 
+        # Compute effective output shapes from graph buffer info.  For
+        # ConcatKernel sub-kernels the runtime tensor has the full concat
+        # shape (e.g. (32,32,2)) but the graph buffer records the sub-
+        # kernel's slice shape (e.g. (32,32,1)).  We normalise the graph
+        # shape (strip trailing 1s, promote 0-d) so the tiling / BlockSpec
+        # pipeline sees the shape the kernel body was generated for.
+        effective_out_shapes: list[tuple[int, ...] | None] = []
+        for param in output_params:
+            buf_name = output_buffer_lookup.get(param)
+            if buf_name is not None:
+                buf = V.graph.get_buffer(buf_name)
+                if buf is not None:
+                    shape = tuple(
+                        int(s) if isinstance(s, (int, sympy.Integer)) else s
+                        for s in buf.get_size()
+                    )
+                    shape = shape if len(shape) > 0 else (1,)
+                    while len(shape) > 1 and shape[-1] == 1:
+                        shape = shape[:-1]
+                    if all(isinstance(d, int) for d in shape):
+                        effective_out_shapes.append(shape)
+                        continue
+            effective_out_shapes.append(None)
+
         # Emit the kernel function with the correct signature
         kernel_signature = (
             f"def {kernel_name}_kernel({', '.join(ctx.full_kernel_params)}):"
@@ -3296,7 +3370,9 @@ class PallasKernel(SIMDKernel):
                 else:
                     self._codegen_strided_reshapes(code, ctx.kernel_input_params)
 
-                    code.writeline("indexer = lambda n: lambda i: [jnp.int32(i)] * n")
+                    self._codegen_strided_reshapes(code, ctx.kernel_input_params)
+
+                code.writeline("indexer = lambda n: lambda i: [jnp.int32(i)] * n")
                     code.writeline("out_specs_pallas = tuple(")
                     code.writeline("    pl.BlockSpec(shape, indexer(len(shape)))")
                     code.writeline(
@@ -3703,6 +3779,13 @@ from torch._inductor.runtime.runtime_utils import (
                 return graph_name
         return None
 
+    def _param_to_buf_name(self, param: str) -> str | None:
+        """Map a kernel parameter name back to its graph buffer name."""
+        for graph_name, inner_name in self.args.input_buffers.items():
+            if inner_name == param:
+                return graph_name
+        return None
+
     def _codegen_tiled_specs(self, ctx: _CodegenContext) -> None:
         """Generate tiled BlockSpec and grid variables for CPU/TPU.
 
@@ -3718,18 +3801,20 @@ from torch._inductor.runtime.runtime_utils import (
         is_tpu_literal = "True" if ctx.is_tpu else "False"
         code.writeline(
             f"_tile, _grid, _ax2g = pallas_compute_tiling("
-            f"out_shapes[0], transpose={transpose_literal}, "
+            f"_pallas_out_shapes[0], transpose={transpose_literal}, "
             f"skip_last_n={skip_n}, exact_only=True, is_tpu={is_tpu_literal})"
         )
         code.writeline("_ng = len(_grid)")
-        code.writeline("_ref = out_shapes[0]")
+        code.writeline("_ref = _pallas_out_shapes[0]")
 
         code.writeline("out_specs_pallas = tuple(")
         code.writeline(
             "    pallas_make_block_spec(s, _ref, _tile, _ax2g, _ng, is_output=True)"
         )
-        code.writeline("    for s in out_shapes")
+        code.writeline("    for s in _pallas_out_shapes")
         code.writeline(")")
+
+        self._codegen_strided_reshapes(code, ctx.kernel_input_params)
 
         self._codegen_strided_reshapes(code, ctx.kernel_input_params)
 

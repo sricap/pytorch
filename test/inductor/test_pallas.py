@@ -480,6 +480,20 @@ class PallasTestsMixin:
         expected = fn(x)
         self.assertEqual(result, expected)
 
+    @skip_if_cuda
+    def test_two_strided_access_on_same_tensor(self):
+        """Test two strided access patterns on the same input with the Pallas backend."""
+
+        def fn(x):
+            return torch.cat((x[::2], x[::4]))
+
+        compiled = self._compile(fn)
+
+        x = torch.arange(16, dtype=torch.float32, device=self.DEVICE)
+        result = compiled(x)
+        expected = fn(x)
+        self.assertEqual(result, expected)
+
     @skip_if_cuda(reason="strided access not supported in Pallas GPU (Mosaic) backend")
     def test_strided_offset_pallas(self):
         """Test strided access with offset."""
@@ -1009,7 +1023,6 @@ class PallasTestsMixin:
         expected = fn(x)
         self.assertEqual(result, expected)
 
-    @skip_if_tpu
     def test_atan2(self):
         """Test atan2 operation."""
 
@@ -1195,7 +1208,6 @@ class PallasTestsMixin:
                 self.assertEqual(result, expected)
 
     @skip_if_cuda
-    @skip_if_tpu
     def test_rope(self):
         """Test Rotary Position Embedding with slice + cat.
 
