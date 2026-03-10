@@ -494,6 +494,20 @@ class PallasTestsMixin:
         expected = fn(x)
         self.assertEqual(result, expected)
 
+    @skip_if_cuda
+    def test_cat(self):
+        """Test two strided access patterns on the same input with the Pallas backend."""
+
+        def fn(x):
+            return torch.cat((x, x))
+
+        compiled = self._compile(fn)
+
+        x = torch.arange(8, dtype=torch.float32, device=self.DEVICE)
+        result = compiled(x)
+        expected = fn(x)
+        self.assertEqual(result, expected)
+
     @skip_if_cuda(reason="strided access not supported in Pallas GPU (Mosaic) backend")
     def test_strided_offset_pallas(self):
         """Test strided access with offset."""
@@ -1231,7 +1245,26 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     @skip_if_cuda
-    @skip_if_tpu  # stack+where fusion doesn't broadcast correctly on TPU yet
+    def test_stack_then_reshape(self):
+        """Test Rotary Position Embedding with interleaved halves.
+
+        Uses even/odd stride-2 slicing instead of contiguous halves, then
+        reassembles via stack + reshape. Exercises strided input access.
+        """
+
+        def fn(x):
+            x1 = x[..., 0::2]
+            x2 = x[..., 1::2]
+            return torch.stack([x1, x2], dim=-1).reshape_as(x)
+
+        compiled = self._compile(fn)
+
+        x = torch.randn(32, 64, device=self.DEVICE)
+        result = compiled(x)
+        expected = fn(x)
+        self.assertEqual(result, expected)
+
+    @skip_if_cuda
     def test_rope_interleaved(self):
         """Test Rotary Position Embedding with interleaved halves.
 
