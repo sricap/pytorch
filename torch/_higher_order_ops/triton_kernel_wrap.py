@@ -1112,7 +1112,6 @@ def identify_accessed_tensors(
             tuple(ordered_arg_names),
         )
 
-
     except Exception:
         log.warning(
             "Encountered an exception in identify_accessed_tensors, assuming every input is mutated",

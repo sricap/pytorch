@@ -16,10 +16,11 @@ from torch._inductor.utils import try_import_ck_lib
 from torch.testing._internal.common_cuda import tf32_off
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
-    MI200_ARCH,
-    MI350_ARCH,
+    MI200_ARCH,  # noqa: F401
+    MI350_ARCH,  # noqa: F401
     parametrize,
-    skipIfRocmArch,
+    skipIfRocm,
+    skipIfRocmArch,  # noqa: F401
 )
 from torch.testing._internal.inductor_utils import (
     _quantize_rowwise,

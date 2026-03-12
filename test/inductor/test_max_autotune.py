@@ -67,13 +67,13 @@ from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FP8
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     IS_WINDOWS,
+    MI350_ARCH,  # noqa: F401
     parametrize,
     random_matrix_with_scaled_reduction_dim,
-    skipIfRocmArch,
     skipIfRocm,
+    skipIfRocmArch,  # noqa: F401
     TEST_WITH_ROCM,
     TEST_XPU,
-    MI350_ARCH,
 )
 from torch.testing._internal.logging_utils import multiple_logs_to_string
 from torch.utils._triton import (
