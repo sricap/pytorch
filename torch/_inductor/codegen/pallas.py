@@ -2614,10 +2614,12 @@ class PallasKernel(SIMDKernel):
             name, index, index_str, needs_flatten
         )
 
-        # Try strided decomposition before multidim slice or flatten.
-        # This generates reshape + static indexing which works on both
-        # CPU and TPU (unlike slice notation which fails on Mosaic).
-        decomp_result = self._decompose_strided_access(index, name)
+        # Try strided decomposition on TPU where Mosaic does not support
+        # slice notation or int64 gather indices.  On CPU/GPU the existing
+        # multi-dim slice and flatten+gather paths work correctly.
+        decomp_result = None
+        if V.graph.get_current_device_or_throw().type == "tpu":
+            decomp_result = self._decompose_strided_access(index, name)
         if decomp_result is not None:
             decomp, dim_groups = decomp_result
             self.strided_input_buffers[name] = decomp
@@ -3557,8 +3559,7 @@ class PallasKernel(SIMDKernel):
                     self._codegen_tiled_specs(ctx)
                 else:
                     self._codegen_strided_reshapes(code, ctx.kernel_input_params)
-
-                    self._codegen_strided_reshapes(code, ctx.kernel_input_params)
+                        self._codegen_strided_reshapes(code, ctx.kernel_input_params)
 
                 code.writeline("indexer = lambda n: lambda i: [jnp.int32(i)] * n")
                     code.writeline("out_specs_pallas = tuple(")
