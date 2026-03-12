@@ -9,6 +9,35 @@ from torch.autograd import Function
 from torch.distributed import group, ReduceOp
 
 
+def _unsupported_under_compile(name):
+    raise RuntimeError(
+        f"torch.distributed.nn.functional.{name} is not supported under "
+        "torch.compile. Use torch.distributed._functional_collectives instead."
+    )
+
+
+def _reduce_op_to_str(op):
+    """Convert ReduceOp to the string format expected by funcols.
+
+    Marked with _dynamo_marked_constant so Dynamo evaluates this at trace time
+    and inlines the result as a constant, avoiding issues with ReduceOp hashing
+    and comparison during tracing.
+    """
+    from torch.distributed._functional_collectives import REDUCE_OP_TO_STR
+
+    return REDUCE_OP_TO_STR[op]
+
+
+_reduce_op_to_str._dynamo_marked_constant = True  # type: ignore[attr-defined]
+
+
+def _resolve_group(pg):
+    """Resolve group.WORLD (None) to the actual default ProcessGroup."""
+    if pg is None:
+        return dist.distributed_c10d._get_default_group()
+    return pg
+
+
 def broadcast(tensor, src, group=group.WORLD):
     """
     Broadcasts the tensor to the whole group.
@@ -26,6 +55,12 @@ def broadcast(tensor, src, group=group.WORLD):
         Tensor: Received tensor from the broadcast op.
 
     """
+    if torch.compiler.is_compiling():
+        from torch.distributed._functional_collectives import (
+            broadcast as funcol_broadcast,
+        )
+
+        return funcol_broadcast(tensor, src, _resolve_group(group))
     return _Broadcast.apply(src, group, tensor)
 
 
@@ -41,6 +76,8 @@ def gather(tensor, dst=0, group=group.WORLD):
     Returns:
         tuple[Tensor]: List of appropriately-sized tensors with the gathered data.
     """
+    if torch.compiler.is_compiling():
+        _unsupported_under_compile("gather")
     return _Gather.apply(dst, group, tensor)
 
 
@@ -61,6 +98,8 @@ def scatter(tensors, src=0, group=group.WORLD):
         Tensor: Output tensor from the scatter operation.
 
     """
+    if torch.compiler.is_compiling():
+        _unsupported_under_compile("scatter")
     return _Scatter.apply(src, group, *tensors)
 
 
@@ -82,6 +121,8 @@ def reduce(tensor, dst, op=ReduceOp.SUM, group=group.WORLD):
         Tensor: Output of the collective.
 
     """
+    if torch.compiler.is_compiling():
+        _unsupported_under_compile("reduce")
     return _Reduce.apply(dst, op, group, tensor)
 
 
@@ -101,6 +142,14 @@ def reduce_scatter(output, input_list, op=ReduceOp.SUM, group=group.WORLD):
         Tensor: Output of the collective.
 
     """
+    if torch.compiler.is_compiling():
+        from torch.distributed._functional_collectives import reduce_scatter_tensor
+
+        result = reduce_scatter_tensor(
+            torch.cat(input_list), _reduce_op_to_str(op), 0, _resolve_group(group)
+        )
+        output.copy_(result)
+        return output
     return _Reduce_Scatter.apply(op, group, output, *input_list)
 
 
@@ -116,6 +165,12 @@ def all_gather(tensor, group=group.WORLD):
         tuple([Tensor]): Output of the collective.
 
     """
+    if torch.compiler.is_compiling():
+        from torch.distributed._functional_collectives import all_gather_tensor
+
+        gathered = all_gather_tensor(tensor, 0, _resolve_group(group))
+        world_size = dist.get_world_size(group=group)
+        return tuple(gathered.chunk(world_size))
     return _AllGather.apply(group, tensor)
 
 
@@ -152,6 +207,8 @@ def _all_gather_base(output_tensor, input_tensor, group=group.WORLD):
         is correctly sized.
 
     """
+    if torch.compiler.is_compiling():
+        _unsupported_under_compile("_all_gather_base")
     return _AllGatherBase.apply(output_tensor, input_tensor, group)
 
 
@@ -168,6 +225,8 @@ def all_to_all(output_tensor_list, input_tensor_list, group=group.WORLD):
         tuple([Tensor]): Output of the collective.
 
     """
+    if torch.compiler.is_compiling():
+        _unsupported_under_compile("all_to_all")
     return _AlltoAll.apply(group, output_tensor_list, *input_tensor_list)
 
 
@@ -197,6 +256,16 @@ def all_to_all_single(
         Tensor: Output of the collective.
 
     """
+    if torch.compiler.is_compiling():
+        from torch.distributed._functional_collectives import (
+            all_to_all_single as funcol_all_to_all_single,
+        )
+
+        result = funcol_all_to_all_single(
+            input, output_split_sizes, input_split_sizes, _resolve_group(group)
+        )
+        output.copy_(result)
+        return output
     return _AlltoAllSingle.apply(
         group, output, output_split_sizes, input_split_sizes, input
     )
@@ -220,6 +289,12 @@ def all_reduce(tensor, op=ReduceOp.SUM, group=group.WORLD):
         Tensor: Output of the collective
 
     """
+    if torch.compiler.is_compiling():
+        from torch.distributed._functional_collectives import (
+            all_reduce as funcol_all_reduce,
+        )
+
+        return funcol_all_reduce(tensor, _reduce_op_to_str(op), _resolve_group(group))
     return _AllReduce.apply(op, group, tensor)
 
 

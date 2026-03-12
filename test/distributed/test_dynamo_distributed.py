@@ -2344,6 +2344,154 @@ class TestSingleProc(DynamoDistributedSingleProcTestCase):
         self.assertEqual(actual, input @ w)
 
 
+@unittest.skipIf(not dist.is_available(), "requires distributed")
+class TestNNFunctionalCompile(torch._dynamo.test_case.TestCase):
+    """Tests for torch.distributed.nn.functional under torch.compile."""
+
+    def setUp(self):
+        super().setUp()
+        dist.init_process_group(backend="fake", rank=0, world_size=2)
+
+    def tearDown(self):
+        dist.destroy_process_group()
+        super().tearDown()
+
+    def test_nn_functional_all_reduce_compiles(self):
+        from torch.distributed.nn.functional import all_reduce
+
+        cnt = torch._dynamo.testing.CompileCounter()
+
+        @torch.compile(backend=cnt, fullgraph=True)
+        def fn(x):
+            return all_reduce(x, op=dist.ReduceOp.SUM)
+
+        x = torch.randn(4, 4)
+        fn(x)
+        self.assertEqual(cnt.frame_count, 1)
+
+    def test_nn_functional_all_gather_compiles(self):
+        from torch.distributed.nn.functional import all_gather
+
+        cnt = torch._dynamo.testing.CompileCounter()
+
+        @torch.compile(backend=cnt, fullgraph=True)
+        def fn(x):
+            return all_gather(x)
+
+        x = torch.randn(4, 4)
+        result = fn(x)
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(cnt.frame_count, 1)
+
+    def test_nn_functional_reduce_scatter_compiles(self):
+        from torch.distributed.nn.functional import reduce_scatter
+
+        cnt = torch._dynamo.testing.CompileCounter()
+
+        @torch.compile(backend=cnt, fullgraph=True)
+        def fn(input_list):
+            output = torch.empty(4, 4)
+            return reduce_scatter(output, input_list)
+
+        input_list = [torch.randn(4, 4), torch.randn(4, 4)]
+        fn(input_list)
+        self.assertEqual(cnt.frame_count, 1)
+
+    def test_nn_functional_all_to_all_single_compiles(self):
+        from torch.distributed.nn.functional import all_to_all_single
+
+        cnt = torch._dynamo.testing.CompileCounter()
+
+        @torch.compile(backend=cnt, fullgraph=True)
+        def fn(x):
+            output = torch.empty_like(x)
+            return all_to_all_single(output, x)
+
+        x = torch.randn(4, 4)
+        fn(x)
+        self.assertEqual(cnt.frame_count, 1)
+
+    def test_nn_functional_broadcast_compiles(self):
+        from torch.distributed.nn.functional import broadcast
+
+        cnt = torch._dynamo.testing.CompileCounter()
+
+        @torch.compile(backend=cnt, fullgraph=True)
+        def fn(x):
+            return broadcast(x, src=0)
+
+        x = torch.randn(4)
+        fn(x)
+        self.assertEqual(cnt.frame_count, 1)
+
+    def test_nn_functional_reduce_unsupported(self):
+        from torch.distributed.nn.functional import reduce
+
+        @torch.compile(fullgraph=True)
+        def fn(x):
+            return reduce(x, dst=0)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "torch.distributed.nn.functional.reduce is not supported under torch.compile",
+        ):
+            fn(torch.randn(4))
+
+    def test_nn_functional_gather_unsupported(self):
+        from torch.distributed.nn.functional import gather
+
+        @torch.compile(fullgraph=True)
+        def fn(x):
+            return gather(x, dst=0)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "torch.distributed.nn.functional.gather is not supported under torch.compile",
+        ):
+            fn(torch.randn(4))
+
+    def test_nn_functional_scatter_unsupported(self):
+        from torch.distributed.nn.functional import scatter
+
+        @torch.compile(fullgraph=True)
+        def fn(x):
+            return scatter([x, x], src=0)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "torch.distributed.nn.functional.scatter is not supported under torch.compile",
+        ):
+            fn(torch.randn(4))
+
+    def test_nn_functional_all_to_all_unsupported(self):
+        from torch.distributed.nn.functional import all_to_all
+
+        @torch.compile(fullgraph=True)
+        def fn(x):
+            return all_to_all([torch.empty_like(x)], [x])
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "torch.distributed.nn.functional.all_to_all is not supported under torch.compile",
+        ):
+            fn(torch.randn(4))
+
+    def test_nn_functional_all_gather_base_unsupported(self):
+        from torch.distributed.nn.functional import _all_gather_base
+
+        @torch.compile(fullgraph=True)
+        def fn(x):
+            output = torch.empty(8)
+            return _all_gather_base(output, x)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "torch.distributed.nn.functional._all_gather_base is not supported under torch.compile",
+        ):
+            fn(torch.randn(4))
+
+
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
 
